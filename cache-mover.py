@@ -166,6 +166,8 @@ def load_os_env_config(config: dict[str, dict[str, any]]) -> dict[str, dict[str,
                 if key == 'EXCLUDED_DIRS':
                     # remove duplicates from exclusions list
                     os_value = list(dict.fromkeys(HARDCODED_EXCLUSIONS + os_value.split(',')))
+                elif key == 'NOTIFICATION_URLS':
+                    os_value = os_value.split(',')
                 config[main_key][key] = os_value
 
     return config
