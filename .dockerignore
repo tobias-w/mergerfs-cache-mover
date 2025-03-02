@@ -9,3 +9,5 @@ images/
 docker-compose.yml
 .dockerignore
 CHANGELOG.md
+venv/
+.venv/
