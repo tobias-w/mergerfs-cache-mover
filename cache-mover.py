@@ -15,7 +15,17 @@ import signal
 from time import time
 from notifications import NotificationHandler
 
-__version__ = "1.1"
+
+__version__ = "1.3"
+
+
+# Hardcode snapraid-related exclusions because reasons
+HARDCODED_EXCLUSIONS = [
+    'snapraid',
+    '.snapraid',
+    '.content'
+]
+
 
 class HybridFormatter(logging.Formatter):
     def __init__(self, fmt="%(levelname)s: %(message)s"):
@@ -30,6 +40,7 @@ class HybridFormatter(logging.Formatter):
         else:
             return f"{self.formatTime(record)} - {record.levelname} - {record.msg}"
 
+
 def setup_logging(config, console_log):
     log_formatter = HybridFormatter()
     log_handler = RotatingFileHandler(
@@ -38,7 +49,7 @@ def setup_logging(config, console_log):
         backupCount=config['Settings']['BACKUP_COUNT']
     )
     log_handler.setFormatter(log_formatter)
-    
+
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.addHandler(log_handler)
@@ -50,22 +61,25 @@ def setup_logging(config, console_log):
 
     return logger
 
+
 def get_script_dir():
     return os.path.dirname(os.path.abspath(__file__))
+
 
 def set_git_dir():
     script_dir = get_script_dir()
     os.environ['GIT_DIR'] = os.path.join(script_dir, '.git')
 
+
 def get_current_commit_hash():
     set_git_dir()
     try:
-        result = subprocess.run(['git', 'rev-parse', 'HEAD'],
-                                capture_output=True, text=True, check=True)
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'],capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         logging.error(f"Error getting current commit hash: {e}")
         return None
+
 
 def run_git_command(command, error_message):
     try:
@@ -76,6 +90,7 @@ def run_git_command(command, error_message):
         logging.error(f"Error output: {e.stderr}")
         raise
 
+
 def auto_update(config):
     set_git_dir()
     current_commit = get_current_commit_hash()
@@ -84,7 +99,7 @@ def auto_update(config):
         return False
 
     update_branch = config['Settings'].get('UPDATE_BRANCH', 'main')
-    
+
     try:
         api_url = f"https://api.github.com/repos/MonsterMuffin/mergerfs-cache-mover/commits/{update_branch}"
         response = requests.get(api_url)
@@ -96,10 +111,8 @@ def auto_update(config):
             logging.info("Attempting to auto-update...")
 
             try:
-                run_git_command(['git', 'fetch', 'origin', update_branch],
-                                f"Failed to fetch updates from {update_branch}.")
-                run_git_command(['git', 'reset', '--hard', f'origin/{update_branch}'],
-                                f"Failed to reset to latest commit on {update_branch}.")
+                run_git_command(['git', 'fetch', 'origin', update_branch], f"Failed to fetch updates from {update_branch}.")
+                run_git_command(['git', 'reset', '--hard', f'origin/{update_branch}'], f"Failed to reset to latest commit on {update_branch}.")
 
                 logging.info("Update successful. Restarting script...")
                 os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -116,16 +129,54 @@ def auto_update(config):
         logging.error(f"Unexpected error during update process: {e}")
         return False
 
-def load_config():
-    # Hardcode snapraid-related exclusions because reasons
-    HARDCODED_EXCLUSIONS = [
-        'snapraid',
-        '.snapraid',
-        '.content'
-    ]
 
+def load_disk_config(config_file_path: str, config: dict[str, dict[str, any]]) -> dict[str, dict[str, any]]:
+
+    with open(config_file_path, 'r') as config_file:
+        disk_config = yaml.safe_load(config_file)
+        # Check that CACHE and BACKING paths are NOT missing
+        for requirement in ["CACHE_PATH", "BACKING_PATH"]:
+            disk_requirement = disk_config['Paths'].get(requirement)
+            if not disk_requirement:
+                raise ValueError(f"---> Required path not configured: {requirement}.\n---> Please set via config.yml.")
+            if not os.path.isdir(disk_requirement):
+                raise SystemError(f"---> {requirement} at {disk_requirement} does not exist or not a valid path! ")
+
+        # Update 'Paths' from disk config
+        config['Paths'].update(disk_config.get('Paths', {}))
+
+        # Update 'Settings' from disk config
+        new_settings = disk_config.get('Settings', {})
+        # remove duplicates from exclusions list
+        new_settings['EXCLUDED_DIRS'] = list(dict.fromkeys(HARDCODED_EXCLUSIONS + disk_config['Settings'].get('EXCLUDED_DIRS', [])))
+        config['Settings'].update(new_settings)
+
+    return config
+
+
+def load_os_env_config(config: dict[str, dict[str, any]]) -> dict[str, dict[str, any]]:
+    # Update config from os environment variables
+    # If not found use default
+    for main_key, sub_key in config.items():
+        for key, _ in sub_key.items():
+            os_value = os.environ.get(key)
+            if key in ['CACHE_PATH', 'BACKING_PATH'] and os_value is None:
+                raise ValueError(f"\n---> Required path {key} not configured: {os_value}\n---> Please set via environment variables!")
+            if os_value != None:
+                if key == 'EXCLUDED_DIRS':
+                    # remove duplicates from exclusions list
+                    os_value = list(dict.fromkeys(HARDCODED_EXCLUSIONS + os_value.split(',')))
+                config[main_key][key] = os_value
+
+    return config
+
+
+def get_config() -> dict[str, dict[str, any]]:
+    # Default value config, since 'settings' are very optional to customize
     default_config = {
         'Paths': {
+            'CACHE_PATH': None,
+            'BACKING_PATH': None,
             'LOG_PATH': '/var/log/cache-mover.log'
         },
         'Settings': {
@@ -136,68 +187,36 @@ def load_config():
             'MAX_LOG_SIZE_MB': 100,
             'BACKUP_COUNT': 1,
             'UPDATE_BRANCH': 'main',
-            'EXCLUDED_DIRS': HARDCODED_EXCLUSIONS,
+            'EXCLUDED_DIRS': HARDCODED_EXCLUSIONS,  # list of strings
             'SCHEDULE': '0 3 * * *',
-            'NOTIFICATIONS_ENABLED': False,  
-            'NOTIFICATION_URLS': [],
-            'NOTIFY_THRESHOLD': False
+            'NOTIFICATIONS_ENABLED': False,
+            'NOTIFY_THRESHOLD': False,
+            'NOTIFICATION_URLS': None,  # list of strings
         }
     }
 
+    def config_file_found(config_file_path: str) -> bool:
+        if os.path.exists(config_file_path):
+            return True
+        return False
+
+    # Try and select configuration type for loading
+    # Dectect if 'config.yml' is present or not
     script_dir = get_script_dir()
     config_path = os.path.join(script_dir, 'config.yml')
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as config_file:
-            file_config = yaml.safe_load(config_file)
-            default_config['Paths'].update(file_config.get('Paths', {}))
-            
-            user_exclusions = file_config.get('Settings', {}).get('EXCLUDED_DIRS') or []
-            combined_exclusions = list(set(HARDCODED_EXCLUSIONS + user_exclusions))  # merge exclusions
-            
-            settings_update = file_config.get('Settings', {})
-            settings_update['EXCLUDED_DIRS'] = combined_exclusions
-            default_config['Settings'].update(settings_update)
 
-    env_mappings = {
-        'CACHE_PATH': ('Paths', 'CACHE_PATH'),
-        'BACKING_PATH': ('Paths', 'BACKING_PATH'),
-        'LOG_PATH': ('Paths', 'LOG_PATH'),
-        'THRESHOLD_PERCENTAGE': ('Settings', 'THRESHOLD_PERCENTAGE', float),
-        'TARGET_PERCENTAGE': ('Settings', 'TARGET_PERCENTAGE', float),
-        'MAX_WORKERS': ('Settings', 'MAX_WORKERS', int),
-        'MAX_LOG_SIZE_MB': ('Settings', 'MAX_LOG_SIZE_MB', int),
-        'BACKUP_COUNT': ('Settings', 'BACKUP_COUNT', int),
-        'UPDATE_BRANCH': ('Settings', 'UPDATE_BRANCH', str),
-        'EXCLUDED_DIRS': ('Settings', 'EXCLUDED_DIRS', lambda x: list(set(HARDCODED_EXCLUSIONS + (x.split(',') if x else [])))),
-        'SCHEDULE': ('Settings', 'SCHEDULE', str),
-        'NOTIFICATIONS_ENABLED': ('Settings', 'NOTIFICATIONS_ENABLED', lambda x: x.lower() == 'true'),
-        'NOTIFICATION_URLS': ('Settings', 'NOTIFICATION_URLS', lambda x: x.split(',')),
-        'NOTIFY_THRESHOLD': ('Settings', 'NOTIFY_THRESHOLD', lambda x: str(x).lower() == 'true' if x is not None else False), # ??? I don't think this is working as I think?
-}
+    if config_file_found(config_path):
+        # Read and load configuration from file
+        default_config = load_disk_config(config_path, default_config)
+    else:
+        # This will generate a default configuration file always
+        # Read OS Environment variables
+        default_config = load_os_env_config(default_config)
 
-    for env_var, (section, key, *convert) in env_mappings.items():
-        env_value = os.environ.get(env_var)
-        if env_value is not None:
-            if convert:
-                env_value = convert[0](env_value)
-            default_config[section][key] = env_value
-
-    required_paths = ['CACHE_PATH', 'BACKING_PATH']
-    missing_paths = [path for path in required_paths 
-                    if not default_config['Paths'].get(path)]
-    
-    if missing_paths:
-        raise ValueError(f"Required paths not configured: {', '.join(missing_paths)}. "
-                        f"Please set via config.yml or environment variables.")
-
-    if os.environ.get('DOCKER_CONTAINER'):
-        default_config['Settings']['AUTO_UPDATE'] = False
-        default_config['Settings']['MAX_LOG_SIZE_MB'] = 100
-        default_config['Settings']['BACKUP_COUNT'] = 1
-
+    # Logic check for threshold and target
     threshold = default_config['Settings']['THRESHOLD_PERCENTAGE']
     target = default_config['Settings']['TARGET_PERCENTAGE']
-    
+
     # empty mode when both 0 w/ log
     if threshold == 0 and target == 0:
         logging.info("Both THRESHOLD_PERCENTAGE and TARGET_PERCENTAGE are 0. Cache will be emptied completely.")
@@ -205,19 +224,25 @@ def load_config():
     elif threshold <= target:
         raise ValueError("THRESHOLD_PERCENTAGE must be greater than TARGET_PERCENTAGE (or both must be 0 to empty cache completely)")
 
+    # Force settings if we are in docker environment?
+    if os.environ.get('DOCKER_CONTAINER'):
+        default_config['Settings']['AUTO_UPDATE'] = False
+        default_config['Settings']['MAX_LOG_SIZE_MB'] = 100
+        default_config['Settings']['BACKUP_COUNT'] = 1
+
     return default_config
+
 
 def is_script_running():
     current_process = psutil.Process()
     current_script = os.path.abspath(__file__)
     script_name = os.path.basename(current_script)
-    
+
     # docker check for process inside container
     if os.environ.get('DOCKER_CONTAINER'):
-        container_processes = [p for p in psutil.process_iter(['pid', 'name', 'cmdline']) 
-                             if p.pid != current_process.pid]
+        container_processes = [p for p in psutil.process_iter(['pid', 'name', 'cmdline']) if p.pid != current_process.pid]
         running_instances = []
-        
+
         for process in container_processes:
             try:
                 if process.name() == 'python' or process.name() == 'python3':
@@ -227,9 +252,9 @@ def is_script_running():
                             running_instances.append(' '.join(cmdline))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-                
+
         return bool(running_instances), running_instances
-    
+
     # non-docker env
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
         if process.pid != current_process.pid:
@@ -243,19 +268,23 @@ def is_script_running():
                 pass
     return False, []
 
+
 def is_child_process(parent, child):
     try:
         return child.ppid() == parent.pid
     except psutil.NoSuchProcess:
         return False
 
+
 def get_fs_usage(path):
     total, used, _ = shutil.disk_usage(path)
     return (used / total) * 100
 
+
 def get_fs_free_space(path):
     total, _, free = shutil.disk_usage(path)
     return free
+
 
 def _format_bytes(bytes: int) -> str:
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -264,27 +293,29 @@ def _format_bytes(bytes: int) -> str:
         bytes /= 1024
     return f"{bytes:.2f}PB"
 
+
 def is_excluded(path, excluded_dirs):
     path_lower = path.lower()
     filename = os.path.basename(path_lower)
-    
+
     # check file patterns for content files
     if filename.endswith('.content'):
         return True
-    
+
     # check dir patterns for snapraid
     path_parts = path_lower.split(os.sep)
     return any(excluded.lower() in path_parts for excluded in excluded_dirs)
 
+
 def gather_files_to_move(config):
     all_files = []
     excluded_dirs = config['Settings']['EXCLUDED_DIRS']
-    
+
     logging.info(f"Exclusion patterns active: {', '.join(excluded_dirs)}")
-    
+
     for dirname, subdirs, filenames in os.walk(config['Paths']['CACHE_PATH']):
         subdirs[:] = [d for d in subdirs if not is_excluded(os.path.join(dirname, d), excluded_dirs)]
-        
+
         if not is_excluded(dirname, excluded_dirs):
             for filename in filenames:
                 all_files.append(os.path.join(dirname, filename))
@@ -300,13 +331,14 @@ def gather_files_to_move(config):
     if config['Settings']['THRESHOLD_PERCENTAGE'] == 0 and config['Settings']['TARGET_PERCENTAGE'] == 0:
         logging.info("Moving all files from cache (empty cache mode)")
         return all_files
-    
+
     # else continue as normal
     while get_fs_usage(config['Paths']['CACHE_PATH']) > config['Settings']['TARGET_PERCENTAGE'] and all_files:
         files_to_move.append(all_files.pop(0))
 
     logging.info(f"Total files to move: {len(files_to_move)}")
     return files_to_move
+
 
 def move_file(src, dest_base, config, target_reached_lock, dry_run=False, stop_event=None):
     if stop_event and stop_event.is_set():
@@ -333,7 +365,7 @@ def move_file(src, dest_base, config, target_reached_lock, dry_run=False, stop_e
             return {'size': 0, 'speed': 0, 'success': False}
 
         start_time = time()
-        
+
         os.makedirs(dest_dir, exist_ok=True)
         src_stat = os.stat(src)
         if src_stat.st_nlink > 1:
@@ -350,18 +382,18 @@ def move_file(src, dest_base, config, target_reached_lock, dry_run=False, stop_e
             return {'size': 0, 'speed': 0, 'success': False}
 
         os.remove(src)
-        
+
         transfer_time = time() - start_time
         transfer_speed = file_size / (transfer_time * 1024 * 1024) if transfer_time > 0 else 0
 
         logging.info("File moved successfully", extra={
-            'file_move': True, 
-            'src': src, 
+            'file_move': True,
+            'src': src,
             'dest': dest,
             'size': file_size,
             'speed': transfer_speed
         })
-        
+
         return {
             'size': file_size,
             'speed': transfer_speed,
@@ -370,6 +402,7 @@ def move_file(src, dest_base, config, target_reached_lock, dry_run=False, stop_e
     except Exception as e:
         logging.error(f"Unexpected error moving file: {str(e)}", extra={'file_move': True, 'src': src, 'dest': dest})
         return {'size': 0, 'speed': 0, 'success': False}
+
 
 def move_files_concurrently(files_to_move, config, dry_run=False, stop_event=None):
     target_reached_lock = Lock()
@@ -394,14 +427,14 @@ def move_files_concurrently(files_to_move, config, dry_run=False, stop_event=Non
                 logging.info("Graceful shutdown in progress. Waiting for current moves to complete.")
                 executor.shutdown(wait=False)
                 break
-            
+
             result = future.result()
             if result.get('target_reached', False) and not target_reached:
                 logging.info(f"Target percentage reached. Stopping new file moves.")
                 target_reached = True
                 executor.shutdown(wait=False)
                 break
-                
+
             if result['success']:
                 files_moved_count += 1
                 total_bytes += result['size']
@@ -410,17 +443,17 @@ def move_files_concurrently(files_to_move, config, dry_run=False, stop_event=Non
 
     elapsed_time = time() - start_time
     avg_speed = total_speed / successful_transfers if successful_transfers > 0 else 0
-    
+
     cache_total, cache_used, cache_free = shutil.disk_usage(config['Paths']['CACHE_PATH'])
     final_cache_usage = (cache_used / cache_total) * 100
-    
+
     backing_total, backing_used, backing_free = shutil.disk_usage(config['Paths']['BACKING_PATH'])
     final_backing_usage = (backing_used / backing_total) * 100
 
     logging.info(f"File move {'simulation' if dry_run else 'operation'} complete.")
     logging.info(f"Cache usage: {final_cache_usage:.2f}% ({_format_bytes(cache_free)} free of {_format_bytes(cache_total)} total)")
     logging.info(f"Backing storage usage: {final_backing_usage:.2f}% ({_format_bytes(backing_free)} free of {_format_bytes(backing_total)} total)")
-    
+
     return {
         'files_moved': files_moved_count,
         'total_bytes': total_bytes,
@@ -433,6 +466,7 @@ def move_files_concurrently(files_to_move, config, dry_run=False, stop_event=Non
         'backing_free': backing_free,
         'backing_total': backing_total
     }
+
 
 def remove_empty_dirs(path, excluded_dirs, dry_run=False):
     empty_dirs_count = 0
@@ -451,7 +485,7 @@ def remove_empty_dirs(path, excluded_dirs, dry_run=False):
                         empty_dirs_count += 1
                     except OSError as e:
                         logging.error(f"Error removing directory {dir_path}: {e}")
-    
+
     if dry_run:
         if empty_dirs_count == 0:
             logging.info("No empty directories found to remove")
@@ -465,14 +499,15 @@ def remove_empty_dirs(path, excluded_dirs, dry_run=False):
 
     return empty_dirs_count
 
+
 def main():
     parser = argparse.ArgumentParser(description='Move files from cache to backing storage.')
-    parser.add_argument('--console-log', action='store_true', help='Display logs in the console.')
-    parser.add_argument('--dry-run', action='store_true', help='Perform a dry run without actually moving files.')
+    parser.add_argument('--console-log', default=False, help='Display logs in the console.')
+    parser.add_argument('--dry-run', default=False, help='Perform a dry run without actually moving files.')
     args = parser.parse_args()
 
     try:
-        config = load_config()
+        config = get_config()
         commit_hash = get_current_commit_hash()
         notify = NotificationHandler(config, commit_hash)
     except ValueError as e:
@@ -517,13 +552,11 @@ def main():
             logging.info(f"Cache usage is {current_usage:.2f}%, {'exceeding threshold' if current_usage > config['Settings']['THRESHOLD_PERCENTAGE'] else 'in empty cache mode'}. Starting file move...")
             files_to_move = gather_files_to_move(config)
 
-            if config['Settings']['THRESHOLD_PERCENTAGE'] == 0 and \
-            config['Settings']['TARGET_PERCENTAGE'] == 0:
-                
+            if config['Settings']['THRESHOLD_PERCENTAGE'] == 0 and config['Settings']['TARGET_PERCENTAGE'] == 0:
                 if not files_to_move:
                     cache_total, _, cache_free = shutil.disk_usage(config['Paths']['CACHE_PATH'])
                     backing_total, _, backing_free = shutil.disk_usage(config['Paths']['BACKING_PATH'])
-                    
+
                     logging.info("Cache is already empty - nothing to move")
                     notify.notify_empty_cache(
                         cache_free=cache_free,
@@ -532,24 +565,20 @@ def main():
                         backing_total=backing_total
                     )
                     return
-            
+
             if args.dry_run:
                 stats = move_files_concurrently(files_to_move, config, dry_run=True, stop_event=stop_event)
-                empty_dirs_count = remove_empty_dirs(config['Paths']['CACHE_PATH'], 
-                                                  config['Settings']['EXCLUDED_DIRS'], 
-                                                  dry_run=True)
-                
+                empty_dirs_count = remove_empty_dirs(config['Paths']['CACHE_PATH'], config['Settings']['EXCLUDED_DIRS'], dry_run=True)
                 logging.info("Dry run summary:")
                 logging.info(f"- Would move {stats['files_moved']} files")
                 logging.info(f"- Would remove {empty_dirs_count} empty directories")
             else:
                 stats = move_files_concurrently(files_to_move, config, dry_run=False, stop_event=stop_event)
                 empty_dirs_count = 0
-                
+
                 if stats['files_moved'] > 0:
-                    empty_dirs_count = remove_empty_dirs(config['Paths']['CACHE_PATH'], 
-                                                      config['Settings']['EXCLUDED_DIRS'])
-                    
+                    empty_dirs_count = remove_empty_dirs(config['Paths']['CACHE_PATH'], config['Settings']['EXCLUDED_DIRS'])
+
                     notify.notify_completion(
                         files_moved=stats['files_moved'],
                         total_bytes=stats['total_bytes'],
@@ -568,7 +597,7 @@ def main():
                 else:
                     cache_total, cache_used, cache_free = shutil.disk_usage(config['Paths']['CACHE_PATH'])
                     final_cache_usage = (cache_used / cache_total) * 100
-                    
+
                     backing_total, backing_used, backing_free = shutil.disk_usage(config['Paths']['BACKING_PATH'])
                     final_backing_usage = (backing_used / backing_total) * 100
 
@@ -583,11 +612,11 @@ def main():
                     logging.info("No files were moved. Skipping directory cleanup.")
         else:
             logging.info(f"Cache usage is {current_usage:.2f}%, below threshold ({config['Settings']['THRESHOLD_PERCENTAGE']}%). No action required.")
-            
+
             # Get disk stats for the notification
             cache_total, cache_used, cache_free = shutil.disk_usage(config['Paths']['CACHE_PATH'])
             backing_total, backing_used, backing_free = shutil.disk_usage(config['Paths']['BACKING_PATH'])
-            
+
             notify.notify_threshold_not_met(
                 current_usage=current_usage,
                 threshold=config['Settings']['THRESHOLD_PERCENTAGE'],
@@ -604,6 +633,7 @@ def main():
 
     if stop_event.is_set():
         logging.info("Script execution interrupted. Some operations may not have completed.")
+
 
 if __name__ == "__main__":
     main()
